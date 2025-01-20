@@ -1,0 +1,922 @@
+---
+title: "HW3: Geospatial Risk Prediction"
+author: "Jun, Youngsang"
+date: "October 17, 2024 / November 12, 2024 (resubmitted)"
+output: 
+  html_document: 
+    theme: readable
+    code_folding: hide
+    quiet: true
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+*Narcotic or Drug Law violation is the violation of laws prohibiting the cultivation, manufacture, distribution, sale, purchase, possession, transportation, importation, and/or use of certain controlled drug or narcotic substances. Narcotic drug law violations are governed by the Controlled Substances Act.*
+
+> If a person is caught possessing narcotic drugs with the intent to sell in Schedule I, II or III it is a felony, and the person could be sentenced up to 15 years in jail and/or pay a fine of \$250,000.
+
+*Since narcotics use or drug abuse may lead to social, physical, emotional, and job-related problems, it is important to prevent relapse through treatment and education for addicts and to prevent addiction in those at risk. The Kensington area of Philadelphia is known as a major hub of narcotic crimes.* **However, raising concerns about its potential spread to other areas, I felt that policing of narcotic crimes was more biased to specific region (i.e., Kensington) than the burglary presented in the textbook.** *Therefore, this assignment applies aspects of the Broken Windows Theory to visualize drug law violations incidents and produce predictive models to forecast similar crimes in other areas of Philadelphia.*
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE, results='hide'}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat.explore)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(classInt)   # for KDE and ML risk class intervals
+library(forcats)
+
+# functions and data directory
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+# Source
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# Disable Scientific Notation
+options(scipen=999)
+options(tigris_class = "sf")
+
+# Set ACS API Key
+census_api_key("b2835f54d89a4499ba29829c908967b86765b345", overwrite = TRUE)
+```
+
+## Crime Incidents in Philadelphia by Crime Types
+
+From January 1, 2023 to December 31, 2023, Philadelphia recorded 161,913 crime incidents.
+The following graph categorizes these incidents by 31 types of crime.
+Of these incidents, Narcotic/Drug Law Violations accounted for 2,551, **and Sex crimes, which is sum of rape and other sex offenses (not commercialized) accounted for 1,519.**
+
+```{r loaddata, warning = FALSE, message = FALSE, results='hide'}
+
+# 2023 Crime data
+philly.crime <- read.csv("https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272023-01-01%27%20AND%20dispatch_date_time%20%3C%20%272024-01-01%27")  
+
+philly.crime <-philly.crime[!is.na(philly.crime$lat), ] %>%
+    st_as_sf(coords = c("lng", "lat"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102728') %>% 
+    distinct()
+
+# Load Police Sector Data in Philadelphia
+philly.policesec <- st_read("~/Documents/Public Policy/HW3/Data/phillyPoliceSector/PhiladelphiaPoliceSectorsBoundaries201202.shp") %>% 
+  st_as_sf(crs = 4326)%>%
+  st_transform(crs = 'ESRI:102728') 
+
+# Load Police District Data in Philadelphia
+philly.police <- st_read("https://opendata.arcgis.com/api/v3/datasets/62ec63afb8824a15953399b1fa819df2_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1") %>% 
+  st_as_sf(crs = 4326)%>%
+  st_transform(crs = 'ESRI:102728') 
+
+# Load Police Stations Data in Philadelphia
+philly.policestn <- st_read("https://opendata.arcgis.com/datasets/7e522339d7c24e8ea5f2c7780291c315_0.geojson") %>% 
+  st_as_sf(crs = 4326)%>%
+  st_transform(crs = 'ESRI:102728') 
+
+# Create Philadelphia Boundary Data
+philly.boundary <- st_union(philly.police)%>%
+  st_transform(crs = 'ESRI:102728') 
+
+# Load Park and Recreation Places Data in Philadelphia
+philly.PPR <- st_read("https://opendata.arcgis.com/api/v3/datasets/9eb26a787a6e448ba426eea7f9f0d93a_0/downloads/data?format=geojson&spatialRefId=4326") %>% 
+  st_as_sf(crs = 4326)%>%
+  st_transform(crs = 'ESRI:102728') 
+```
+
+```{r}
+ggplot(philly.crime, aes(x = fct_rev(fct_infreq(text_general_code)),
+                         fill=ifelse(text_general_code == "Narcotic / Drug Law Violations" ,"Highlighted",ifelse(text_general_code == "Rape" | text_general_code =="Other Sex Offenses (Not Commercialized)" ,"Highlighted2","Others")))) +
+  geom_bar() +
+  labs(
+    title = "Crime Incidents in Philadelphia by Crime Types",
+    subtitle = "Jan 2023 - Dec 2023, by number of incidents order",x="",y="",
+    caption="Data: Philadelphia Police Department")+
+  coord_flip() + 
+  scale_fill_manual(values = c("Highlighted" = "#336699", "Highlighted2" = "#aa3355",  "Others" = "gray")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r depdatavis, warning = FALSE, message = FALSE}
+crimeNarcotic <- philly.crime %>% filter(text_general_code == "Narcotic / Drug Law Violations")
+crimeSex <- philly.crime %>% filter(text_general_code == "Rape" | text_general_code == "Other Sex Offenses (Not Commercialized)")
+
+# uses grid.arrange to organize independent plots
+grid.arrange(ncol=3,
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  geom_sf(data = philly.crime, colour="#555555", size=0.1, show.legend = "point") +
+  labs(title= "Philadelphia Crime Incidents in 2023",
+       subtitle = "All Crime Types") +
+  theme_void()+
+  theme( legend.position = "none"),             
+             
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  geom_sf(data = crimeNarcotic, colour="#555555", size=0.1, show.legend = "point") +
+  labs(title= "",
+       subtitle = "Narcotic / Drug Law Violations") +
+  theme_void()+
+  theme( legend.position = "none"),
+
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  geom_sf(data = crimeSex, colour="#555555", size=0.1, show.legend = "point") +
+  labs(title= "",
+       subtitle = "Sex Crime") +
+  theme_void()+
+  theme( legend.position = "none"),
+
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  stat_density2d(data = data.frame(st_coordinates(philly.crime)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis(name="") +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(caption="") +
+  theme_void()+
+  theme(legend.position = "none"),
+
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  stat_density2d(data = data.frame(st_coordinates(crimeNarcotic)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis(name="") +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(caption = "") +
+  theme_void()+
+  theme(legend.position = "none"),
+
+ggplot() + 
+  geom_sf(data = philly.police, color="white") +
+  stat_density2d(data = data.frame(st_coordinates(crimeSex)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis(name="") +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(caption = "Data: Philadelphia Police Department") +
+  theme_void()+
+  theme(legend.position = "none")
+)
+```
+
+This assignment examines whether there is a spatial correlation between locations of Narcotic / Drug Violations incidents occurred and distance of police stations and locations of parks and public recreation places, **as well as the location of sex crimes incidents occurred,** and use this to create a predictive model.
+
+The following map shows the locations of police stations and districts, and Public Parks and Recreations (PPR) places' locations in Philadelphia.
+**First,** Areas farther from police stations may give criminals a sense of being less monitored, potentially leading to a higher frequency of drug incidents.
+Some areas with active drug trade may be relatively close to police stations, indicating that the presence of police is not always enough to deter narcotic crimes.
+
+**Second,** Parks are often large, and the view is easily obstructed by trees or structures, making it possible for discreet activities to occur.
+Some parks may have gaps in security during nighttime hours.
+This could increase the likelihood of parks being chosen as locations for Narcotics / Drugs Violations.
+
+**Lastly, both narcotic and sex crimes are prevalent in areas with a high density of nightlife establishments. A study indicates that areas with high incidences of drug offenses may also have elevated levels of sex crimes (Sherman et al, 1989).**
+
+```{r indepdatavis, warning = FALSE, message = FALSE}
+# Visualize Police and Park Data
+grid.arrange(ncol=2,
+             ggplot()+
+  geom_sf(data=philly.policesec, aes(linetype = "Police Sectors"), fill=NA, color="gray")+
+  geom_sf(data=philly.police, aes(linetype = "Police Districts"), size=1, fill=NA)+
+  geom_sf(data=philly.boundary, size=20, fill=NA)+
+  geom_sf(data=philly.policestn, aes(color = "Police Stations"), size=3)+
+  labs(
+    title = "Police Districts, Sectors, and Stations",
+    subtitle = "Philadelphia, PA",
+    linetype = "Line Types",  
+    color = "Legend"
+  ) +
+  scale_linetype_manual(values = c("Police Districts" = "solid", "Police Sectors" = "dashed")) +
+  scale_color_manual(values = c("Police Stations" = "#336699")) +
+  guides(
+    linetype = guide_legend(title = "", 
+                            override.aes = list(fill = NA)),
+    color = guide_legend(title = "")
+  ) +
+  theme_void() +
+   theme(
+    legend.position = "bottom",  
+  ),
+ggplot()+
+  geom_sf(data=st_union(philly.police), size=1, fill=NA)+
+  geom_sf(data=philly.PPR, color="#339966")+
+  labs(
+    title = "Parks & Recreation Program Sites",
+    subtitle = "",
+    linetype = "Line Types",  
+    color = "Legend"
+  ) +
+  guides(
+    linetype = guide_legend(title = "", 
+                            override.aes = list(fill = NA)),
+    color = guide_legend(title = "")
+  ) +
+  theme_void() +
+   theme(
+    legend.position = "bottom",  
+  ))
+```
+
+## Joining All Crimes and Narcotic Violation Data (Dependent Variable) to the Fishnet Grid Cells
+
+```{r fishnetvis, warning = FALSE, message = FALSE}
+fishnet <- 
+  st_make_grid(philly.boundary,
+               cellsize = 1000, 
+               square = TRUE) %>%
+  .[philly.boundary] %>%            # fast way to select intersecting polygons
+  st_sf() %>%
+  mutate(uniqueID = 1:n())
+```
+
+```{r fishnetdepdatavis, warning = FALSE, message = FALSE}
+crime_net <- 
+  dplyr::select(philly.crime) %>% 
+  mutate(countCrimes = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countCrimes = replace_na(countCrimes, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+crimeNar_net <- 
+  dplyr::select(crimeNarcotic) %>% 
+  mutate(countCrimes = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countCrimes = replace_na(countCrimes, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+crimeSex_net <- 
+  dplyr::select(crimeSex) %>% 
+  mutate(countCrimes = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countCrimes = replace_na(countCrimes, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+grid.arrange(ncol=3,
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countCrimes), color = NA) +
+  scale_fill_viridis(name = "") +
+  labs(title = "Crime Incidents in Philadelphia, 2023", subtitle="All Crime Types") +
+  theme_void()+
+  theme(legend.position = "bottom"),
+ggplot() +
+  geom_sf(data = crimeNar_net, aes(fill = countCrimes), color = NA) +
+  scale_fill_viridis(name = "") +
+  labs(title = "", subtitle="Narcotic Violations") +
+  theme_void()+
+  theme(legend.position = "bottom"),
+ggplot() +
+  geom_sf(data = crimeSex_net, aes(fill = countCrimes), color = NA) +
+  scale_fill_viridis(name = "") +
+  labs(title = "", subtitle="Sex Crime") +
+  theme_void()+
+  theme(legend.position = "bottom"))
+```
+
+## Joining Risk Factors Data (Independent Variable) to the Fishnet Grid Cells
+
+```{r fishnetindepdatavis, warning = FALSE, message = FALSE, results='hide'}
+philly.policestn <- philly.policestn %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Police Stations") %>%
+  na.omit() %>%
+  st_transform(st_crs(fishnet))
+
+philly.PPR <- philly.PPR %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Parks & Rec") %>%
+  na.omit() %>%
+  st_transform(st_crs(fishnet))
+
+philly.crimeSex <- crimeSex %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Sex Crime") %>%
+  na.omit() %>%
+  st_transform(st_crs(fishnet))
+
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/philadelphia.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+
+vars_net <- rbind(philly.policestn, philly.PPR, philly.crimeSex) %>%
+  st_join(fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  left_join(fishnet, ., by = "uniqueID") %>%
+  spread(Legend, count, fill=0) %>%
+  dplyr::select(-`<NA>`) %>%
+  ungroup()
+
+vars_net.long <-
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+```
+
+```{r fishnetindepdatavis2, warning = FALSE, message = FALSE}
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), 
+              aes(fill = value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange, c(mapList, ncol=3, top="Risk Factors by Fishnet"))
+```
+
+## Count of Risk Factors by Grid Cell and Visualize the Nearest Neighbor (NN) Features
+
+In this figure below, the nearest neighbor distance from police stations, public parks and recreation places is displayed in blue for closer locations, and in green and yellow for further locations.
+
+```{r count1, warning = FALSE, message = FALSE}
+## create NN from Police Stations and Parks
+vars_net <- vars_net %>%
+    mutate(policeStn.nn = nn_function(st_coordinates(st_centroid(vars_net)), 
+                                           st_coordinates(philly.policestn),
+                                           k = 3)) %>%
+    mutate(PPR.nn = nn_function(st_coordinates(st_centroid(vars_net)), 
+                                           st_coordinates(philly.PPR),
+                                           k = 3)) %>%
+    mutate(crimeSex.nn = nn_function(st_coordinates(st_centroid(vars_net)), 
+                                           st_coordinates(philly.crimeSex),
+                                           k = 3))
+```
+
+```{r count2, warning = FALSE, message = FALSE}
+vars_net.long.nn <-
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+  gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long.nn, Variable == i), 
+              aes(fill = value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange, c(mapList, ncol=3, top="Nearest Neighbor Risk Factors by Fishnet"))
+```
+
+## Join NN feature to the Fishnet Grid Cells
+
+The following fishnet-style maps are simply represents the police districts and neighborhoods in Philadelphia.
+
+```{r joinNN1, results='hide'}
+## important to drop the geometry from joining features
+finalNar_net <-
+  left_join(crimeNar_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+finalNar_net <-
+  st_centroid(finalNar_net) %>%
+    st_join(dplyr::select(neighborhoods, name), by = "uniqueID") %>%
+    st_join(dplyr::select(philly.police, DISTRICT_), by = "uniqueID") %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(finalNar_net, geometry, uniqueID)) %>%
+      st_sf() %>%
+    st_transform('ESRI:102728') %>% 
+  na.omit()
+```
+
+```{r joinNN2, warning = FALSE, message = FALSE}
+grid.arrange(ncol=2,
+ggplot() +
+      geom_sf(data = finalNar_net, aes(fill=DISTRICT_), color="gray") +
+       scale_fill_viridis_d(option = "D") +
+      labs(title="Police Districts in Philadelphia") +
+      mapTheme()+
+      theme(legend.position = "none"),
+
+ggplot() +
+      geom_sf(data = finalNar_net, aes(fill=name), color="gray") +
+       scale_fill_viridis_d(option = "D") +
+      labs(title="Neighborhoods in Philadelphia") +
+      mapTheme()+
+      theme(legend.position = "none"))
+```
+
+## Local Moran's I for Fishnet Grid Cells
+
+By Local Moran's I, I can see if cells are part of a significant cluster of high or low values, or if a cell is near a cluster.
+The null hypothesis for the Local Moran's I is that the Narcotic / Drug Violations count at a given location is randomly distributed relative to its immediate neighbors, i.e. "queen" neighbors (e.g. the cells to the immediate north, south, east, west, and diagonal).
+
+```{r}
+## generates warnings from PROJ issues
+## {spdep} to make polygon to neighborhoods... 
+finalNar_net.nb <- poly2nb(as_Spatial(finalNar_net), queen=TRUE)
+## ... and neighborhoods to list of weigths
+finalNar_net.weights <- nb2listw(finalNar_net.nb, style="W", zero.policy=TRUE)
+
+# print(final_net.weights, zero.policy=TRUE)
+```
+
+The following four figures show, from left to right, the simple count of Narcotic Violations, Local Moran's I results, the p-values for these, and the significant hotspots (p-value less than 0.001).
+The results firstly confirm that the simple counts and Local Moran's I are concentrated in the Kensington area.
+Second, the p-values show that the Kensington area and some areas around the police station have high p-values, while the other areas are not statistically significant.
+The last figure is a map that shows hot spots with p-values less than 0.001 in yellow, and the other areas in purple, which shows only the Kensington area and three other areas around the police station (almost a single pixel) are marked in yellow.
+Local Moran's I is useful because it can check the reliability of not only hotspots but also coldspots, but for Narcotics / Drugs Violations, the number of cases is too concentrated in a specific area, making it difficult to check the reliability of coldspots.
+
+```{r}
+## localmoran
+local_morans <- localmoran(finalNar_net$countCrimes, finalNar_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+# join local Moran's I results to fishnet
+finalNar_net.localMorans <- 
+  cbind(local_morans, as.data.frame(finalNar_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Nar_Count = countCrimes, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+```
+
+```{r}
+## This is just for plotting
+vars <- unique(finalNar_net.localMorans$Variable)
+varList <- list()
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(finalNar_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 4, top = "Local Morans I statistics, Narcotic Violations"))
+```
+
+The following is a graph showing the p-value levels, which shows that the hotspot p-value in the Kensington area is very small.
+
+```{r}
+## This is just for plotting
+finalNar_net.localMoransbypval <- 
+  cbind(local_morans, as.data.frame(finalNar_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Nar_Count = countCrimes, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots0.1 = ifelse(P_Value <= 0.1 , 1, 0)) %>%
+  mutate(Significant_Hotspots0.001 = ifelse(P_Value <= 0.001 , 1, 0)) %>%  
+  mutate(Significant_Hotspots0.00001 = ifelse(P_Value <= 0.00001 , 1, 0)) %>%  
+  mutate(Significant_Hotspots0.0000001 = ifelse(P_Value <= 0.0000001, 1, 0)) %>%  
+  gather(Variable, Value, -geometry)
+
+finalNar_net.localMoransbypval <- subset(finalNar_net.localMoransbypval, grepl("Significant_Hotspots", Variable)) 
+finalNar_net.localMoransbypval$Value <- factor(finalNar_net.localMoransbypval$Value)
+custom_labels <- c("Significant_Hotspots0.1" = "0.1", 
+                   "Significant_Hotspots0.001" = "0.001",
+                   "Significant_Hotspots0.00001" = "0.00001",
+                   "Significant_Hotspots0.0000001" = "0.0000001")
+custom_legend <- c("0" = "Not Significant", "1" = "Significant")
+ggplot() +
+      geom_sf(data = finalNar_net.localMoransbypval, 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis_d(labels = custom_legend, name="") +
+      labs(title="Narcotic Violations Hotspots of Varing Significance") +
+      facet_wrap(~Variable, ncol=4, labeller = labeller(Variable = custom_labels))+
+      mapTheme(title_size = 14) + theme(legend.position="bottom")
+```
+
+## Measuring Nearest Neighbor Distance to Hotspot
+
+Below is the result of measuring the nearest neighbor distance to this hotspots for each fishnet cell in Philadelphia, with a p-value less than 0.001.
+The North, Northeast, and Northwest Philadelphia areas showed the nearest neighbor distance to the hotspots to be less than 2.5 miles.
+
+```{r}
+# generates warning from NN
+finalNar_net <- finalNar_net %>% 
+  mutate(narcotic.isSig = 
+           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+  mutate(narcotic.isSig.dist = 
+           nn_function(st_coordinates(st_centroid(finalNar_net)),
+                       st_coordinates(st_centroid(filter(finalNar_net, 
+                                           narcotic.isSig == 1))), 
+                       k = 1)) %>%
+  mutate(narcotic.isSig.distmile = 
+           narcotic.isSig.dist/5280)
+
+```
+
+```{r}
+ggplot() +
+      geom_sf(data = finalNar_net, aes(fill=narcotic.isSig.distmile), colour=NA) +
+      scale_fill_viridis(name="NN Distance (mi)") +
+      labs(title="Narcotic Violance NN Distance") +
+      mapTheme()
+```
+
+The following six plots show count and nearest neighbor correlations side-by-side.
+
+```{r correl1, warning = FALSE, message = FALSE, results='hide'}
+correlation.long <-
+  st_drop_geometry(finalNar_net) %>%
+    dplyr::select(-uniqueID, -cvID, -name, -DISTRICT_, -narcotic.isSig.distmile) %>%
+    gather(Variable, Value, -countCrimes)
+
+correlation.cor <-
+  correlation.long %>%
+  group_by(Variable) %>%
+  summarize(correlation = cor(Value, countCrimes, use = "complete.obs"))
+```
+
+```{r correl2, warning = FALSE, message = FALSE}
+ggplot(correlation.long, aes(Value, countCrimes)) +
+  geom_point(size=0.1) +
+  geom_text(data=correlation.cor, aes(label=paste("r=", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust=1.5, hjust=-.1) +
+  geom_smooth(method = "lm", se = FALSE, color="black") +
+  facet_wrap(~Variable, ncol=3, scales = "free") +
+  labs(title="Correlation of Variables with Narcotic Violations",
+       subtitle="Correlation Coefficients",
+       x="Value", y="Narcotic Violations") +
+  mapTheme(title_size = 14)
+```
+
+## Modeling and Cross-Validation
+
+In this section, Leave One Group Out (LOGO) spatial CV on these spatial features performed using only nearest neighbor, and distance to cluster variables.
+Since geospatial risk models are purely spatial, spatial cross-validation is an important option.
+LOGO is to hold-out one local area, train the model on the remaining n-1 areas, predict for the hold-out, and record the goodness of fit.
+
+`crossValidate` takes a `dataset`, a dependent variable `dependentVariable` (`countCrimes`), a list of independent variables (`reg.ss.vars`) , and an `id` - which is a cross validation category.
+
+```{r results='hide'}
+
+# View(crossValidate)
+
+reg.vars <- c("policeStn.nn","PPR.nn","crimeSex.nn")
+## define the variables we want
+reg.ss.vars <- c("policeStn.nn","PPR.nn","crimeSex.nn","narcotic.isSig","narcotic.isSig.dist")
+
+## RUN REGRESSIONS
+reg.CV <- crossValidate(
+  dataset = finalNar_net,
+  id = "cvID",                           
+  dependentVariable = "countCrimes",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = cvID, countCrimes, Prediction, geometry)
+
+reg.ss.CV <- crossValidate(
+  dataset = finalNar_net,
+  id = "cvID",                           
+  dependentVariable = "countCrimes",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = cvID, countCrimes, Prediction, geometry)
+
+## LOGO CV
+reg.spatialCV <- crossValidate(
+  dataset = finalNar_net,
+  id = "name",                           
+  dependentVariable = "countCrimes",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, countCrimes, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = finalNar_net,
+  id = "name",                           
+  dependentVariable = "countCrimes",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countCrimes, Prediction, geometry)
+
+reg.summary <-
+  rbind(
+    mutate(reg.CV,
+           Error = Prediction - countCrimes,
+           Regression = "Random k-fold CV: Just Risk Factors"),
+    mutate(reg.ss.CV,
+           Error = Prediction - countCrimes,
+           Regression = "Random k-fold CV: Spatial Process"),
+    mutate(reg.spatialCV,
+           Error = Prediction - countCrimes,
+           Regression = "Spatial LOGO-CV: Just Risk Factors"),
+    mutate(reg.ss.spatialCV,
+           Error = Prediction - countCrimes,
+           Regression = "Spatial LOGO-CV: Spatial Process")
+  ) %>%
+  st_sf()
+```
+
+The following results show the calculated errors across space, by four different methods.
+This result confirms the conclusion that the spatial process features improve the model, since the counts with small MAEs slightly increased in each spatial process, and the mean MAE value slightly decreased.
+
+```{r regandfold1, warning = FALSE, message = FALSE, results='hide'}
+# calculate errors by NEIGHBORHOOD
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - countCrimes, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>% 
+  arrange(desc(MAE))
+error_by_reg_and_fold %>% 
+  arrange(MAE)
+```
+
+```{r regandfold2, warning = FALSE, message = FALSE}
+## plot histogram of OOF (out of fold) errors
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
+    facet_wrap(~Regression) +
+    scale_x_continuous(breaks = seq(0, 11, by = 1)) + 
+    labs(title="Distribution of MAE", subtitle = "k-fold CV vs LOGO-CV",
+         x="Mean Absolute Error", y="Count") +
+    plotTheme()
+```
+
+```{r regandfold3, warning = FALSE, message = FALSE}
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>%
+  summarize(Mean_MAE = round(mean(MAE),2), 
+            SD_MAE = round(sd(MAE), 2)) %>%
+  kable() %>%
+    kable_styling("striped", full_width = F) %>%
+    row_spec(2, color="black", background="yellow") %>%
+    row_spec(4, color="black", background="yellow")
+```
+
+The following map visualizes the LOGO-CV errors spatially.
+In other cases, these kinds of maps can visualize where the higher errors occur when the local spatial process is not accounted for.
+In this case, however, it was not known whether the higher errors occur when the local spatial process is not accounted for because the hotspots were concentrated in a specific area (Kensington area) and the remaining areas did not have a large difference in value.
+However, it was confirmed that the MAE value of the hotspots slightly decreased.
+
+```{r}
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "LOGO")) %>%
+  ggplot() + 
+    geom_sf(aes(fill=MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis()+
+    labs(title="Narcotic Violations Errors by LOGO-CV Regression")+
+    theme_void() +
+    theme(legend.position = "bottom")
+```
+
+The following three figures are maps comparing observed, predicted (just risk factors), and predicted (with spatial process).
+The predicted are much smoother than the observed, and there is little difference between predicted (just risk factors) and predicted (with spatial process) on the maps.
+
+```{r}
+grid.arrange(ncol=3,
+
+ggplot(reg.CV) +
+  geom_sf(aes(fill = countCrimes), color = NA) +
+  scale_fill_viridis(name = "", limits=c(0,160)) +
+  labs(title = "Observed and Predicted Crime Incidents in Philadelphia, 2023", subtitle="Observed Narcotic Violations") +
+  theme_void()+
+  theme(legend.position = "bottom"),
+ggplot(reg.spatialCV) +
+  geom_sf(data = reg.summary, aes(fill = Prediction), color = NA) +
+  scale_fill_viridis(name = "", limits=c(0,160)) +
+  labs(title = "", subtitle="Predicted (LOGO-CV, Just Risk Factors)") +
+  theme_void()+
+  theme(legend.position = "bottom"),
+ggplot(reg.ss.spatialCV) +
+  geom_sf(data = reg.summary, aes(fill = Prediction), color = NA) +
+  scale_fill_viridis(name = "", limits=c(0,160)) +
+  labs(title = "", subtitle="Predicted (LOGO-CV, Spatial Process)") +
+  theme_void()+
+  theme(legend.position = "bottom")
+)
+
+
+```
+
+## Kernel Density vs predictions
+
+By Kernel Density estimates (e.g. a hotspot map), the predictions to across-time generalizability comparison is possible.
+The following map shows three kernel density maps at three different scales.
+
+```{r}
+# demo of kernel width
+crime_ppp <- as.ppp(st_coordinates(crimeNarcotic), W = st_bbox(finalNar_net))
+crime_KD.1000 <- spatstat.explore::density.ppp(crime_ppp, 1000)
+crime_KD.1500 <- spatstat.explore::density.ppp(crime_ppp, 1500)
+crime_KD.2000 <- spatstat.explore::density.ppp(crime_ppp, 2000)
+crime_KD.df <- rbind(
+  mutate(data.frame(rasterToPoints(mask(raster(crime_KD.1000), as(neighborhoods, 'Spatial')))), Legend = "1000 Ft."),
+  mutate(data.frame(rasterToPoints(mask(raster(crime_KD.1500), as(neighborhoods, 'Spatial')))), Legend = "1500 Ft."),
+  mutate(data.frame(rasterToPoints(mask(raster(crime_KD.2000), as(neighborhoods, 'Spatial')))), Legend = "2000 Ft.")) 
+
+crime_KD.df$Legend <- factor(crime_KD.df$Legend, levels = c("1000 Ft.", "1500 Ft.", "2000 Ft."))
+```
+
+```{r}
+ggplot(data=crime_KD.df, aes(x=x, y=y)) +
+  geom_raster(aes(fill=layer)) + 
+  facet_wrap(~Legend) +
+  coord_sf(crs=st_crs(finalNar_net)) + 
+  scale_fill_viridis(name="Density") +
+  labs(title = "Kernel density with 3 different search radii") +
+  mapTheme(title_size = 14)
+```
+
+```{r}
+
+as.data.frame(crime_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(finalNar_net)) %>%
+  aggregate(., finalNar_net, mean) %>%
+   ggplot() +
+     geom_sf(aes(fill=value)) +
+#     geom_sf(data = sample_n(philly.crime, 1500), size = .5) +
+     scale_fill_viridis(name = "Density") +
+     labs(title = "Kernel density of 2023 Narcotic Violations in Philly") +
+     mapTheme(title_size = 14)
+```
+
+
+## Generalizability by neighborhood context
+
+The following table is the CV result after dividing the race context into Majority White and Majority Non-White in Philadelphia at the census tract level to assess generalizability across these groups. As a result of performing spatial LOGO-CV for each group, the prediction model underestimated narcotic crime incidents for the Majority Non-White, and overestimated for Majority White in both Just Risk Factors and Spatial Process.
+
+```{r gen, warning = FALSE, message = FALSE, progress = FALSE, result='hide'}
+nhoods <-  
+  get_acs(geography = "tract",
+          variables = c("B01003_001E","B02001_002E"), 
+          year=2020, state="PA",
+          county="Philadelphia", geometry=TRUE) %>%
+  st_transform(crs = 'ESRI:102728') %>%
+  separate(NAME, into = c("Census_Tract", "City_State"), sep = ", ", extra = "merge") %>%
+  mutate(
+    Census_Tract = gsub("Census Tract ", "", Census_Tract),
+    City_State = gsub(" County, Pennsylvania", "", City_State)) %>%
+  dplyr::select(  -moe)%>%
+  spread(key = variable, value = estimate) %>%
+  rename(TotalPop = B01003_001,
+         NumberWhites = B02001_002) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority White", "Majority Non-White")) %>%
+  .[neighborhoods,]
+```
+```{r gen2, warning = FALSE, message = FALSE}
+ggplot() +
+  geom_sf(data = nhoods, aes(fill = raceContext), color = NA) +
+  scale_fill_manual(values = c("Majority White" = "#FDE725FF", "Majority Non-White" = "#440154FF")) +
+  labs(title = "Neighborhood Context in Philadelphia") +
+  mapTheme()
+```
+
+
+
+```{r gen3, warning = FALSE, message = FALSE}
+reg.summary %>%
+  filter(str_detect(Regression, "LOGO")) %>%
+  st_centroid() %>%
+  st_join(nhoods) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, raceContext) %>%
+  summarize(mean.Error = mean(Error, na.rm=T)) %>%
+  spread(raceContext, mean.Error) %>%
+  kable(caption = "Mean Error by Neighborhood Racial Context") %>%
+  kable_styling("striped", full_width = F)
+```
+
+
+## Comparing 2023 Narcotic Violations Incidents with 2024
+
+In this section, it can be defined whether the 2023 model forecast above predicts better than a kernel density estimate on 2023 data for the following year (2024) incidents.
+
+```{r}
+crimeNarcotic24 <- read.csv("https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272024-01-01%27%20AND%20dispatch_date_time%20%3C%20%272025-01-01%27") %>%
+  filter(text_general_code == "Narcotic / Drug Law Violations" 
+         ) # 2024 Narcotic Violations Crime data
+
+crimeNarcotic24 <- subset(crimeNarcotic24, the_geom!='0101000020E6100000A5A31CCC262054C0A8BE77C4B61C4540') #error
+crimeNarcotic24 <- subset(crimeNarcotic24, the_geom!='0101000020E6100000E3D840DB262054C0CCE8EC09B71C4540') #error
+
+crimeNarcotic24 <-crimeNarcotic24[!is.na(crimeNarcotic24$lat), ] %>%
+    st_as_sf(coords = c("lng", "lat"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102728') %>% 
+    distinct() %>%
+  .[fishnet,]
+```
+
+```{r}
+
+crime_KDE_sum <- as.data.frame(crime_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(finalNar_net)) %>%
+  aggregate(., finalNar_net, mean) 
+
+kde_breaks <- classIntervals(crime_KDE_sum$value, 
+                             n = 5, "fisher")
+
+crime_KDE_sf <- crime_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = classInt::findCols(kde_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(crimeNarcotic24) %>% mutate(countCrimes = 1), ., sum) %>%
+    mutate(countCrimes = replace_na(countCrimes, 0))) %>%
+  dplyr::select(label, Risk_Category, countCrimes)
+```
+
+```{r}
+ml_breaks <- classIntervals(reg.ss.spatialCV$Prediction, 
+                             n = 5, "fisher")
+crime_risk_sf <-
+  reg.ss.spatialCV %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category =classInt::findCols(ml_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(crimeNarcotic24) %>% mutate(countCrimes = 1), ., sum) %>%
+      mutate(countCrimes  = replace_na(countCrimes , 0))) %>%
+  dplyr::select(label,Risk_Category, countCrimes )
+```
+
+As a result in the following maps, the risk prediction model tended to appear smooth.
+This tend can be confirmed in the next plots.
+
+```{r}
+rbind(crime_KDE_sf, crime_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+ #   geom_sf(data = sample_n(philly.crime24, 2000), size = .5, colour = "black") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2024 crime risk predictions; 2024 crime") +
+    mapTheme(title_size = 14)
+```
+
+In addition, in the risk prediction model in the following plots, the **3rd and 4th** were over-estimated, and the **1st, 2nd and 5th** were under-estimated compared to the KD model. According to the textbook, a well-fit model should show that the risk prediction captures a greater share of 2024 in the highest risk category relative to the kernel density. **In the risk predictions, many areas classified as 5th were predicted as 4th based on the actual narcotic incidents that occurred in 2024. However, by focusing on combined areas ranked 2nd and 3rd, it becomes clear that this model can effectively predict future locations of narcotic crime incidents.**
+
+```{r KDErisk, warning = FALSE, message = FALSE}
+rbind(crime_KDE_sf, crime_risk_sf) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countCrimes = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countCrimes / sum(countCrimes)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE, name = "Model") +
+      labs(title = "Risk prediction vs. Kernel density, 2024 Narcotic Violations",
+           y = "% of Test Set Narcotic Violations (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+## Conclusions and Discussion
+
+In this assignment, a geospatial risk model for Narcotics / Drugs Crimes in Philadelphia in 2023 was produced based on (1) the locations of police stations and (2) public parks and recreation places and (3) spatial distribution of crime incidents related to sex offenses, as well as LOGO cross-validation and kernel density analysis for the model, and comparison with application to the 2024 data.
+The analysis **still** revealed that the Kensington area formed a significant hotspot for narcotic crimes, **but further the prediction model shows a broader area in 2024, expecting the potential spatial spread og drug-related crimes based on the Broken Windows Theory. In addition, the generalizability of the model across neighborhoods with different racial contexts was validated.**
+In the future, given the importance of crime prevention, a spatial analysis approach with the efforts to incorporate additional factors such as police patrol routes, ports, airports, major roads, and traffic information must be necessary.
+
+## References:
+
+<https://www.pasda.psu.edu/uci/DataSummary.aspx?dataset=1028>
+
+<https://github.com/blackmad/neighborhoods>
+
+Sherman, L., Gartin, P., and Buerger, M.
+(1989), Hot Spots of Predatory Crime: Routine Activities and the Criminology of Place
